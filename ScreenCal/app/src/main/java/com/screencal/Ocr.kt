@@ -10,6 +10,9 @@ import android.graphics.Rect
 import com.googlecode.tesseract.android.TessBaseAPI
 import java.io.File
 
+/** Результат OCR: текст и слова с координатами (в пикселях подготовленной картинки). */
+class OcrResult(val text: String, val words: List<OcrWord>, val width: Int, val height: Int)
+
 /** Офлайн-распознавание текста (Tesseract, русский + английский). Работает без интернета. */
 object Ocr {
 
@@ -25,23 +28,43 @@ object Ocr {
         return base
     }
 
-    fun recognize(ctx: Context, src: Bitmap): String {
+    fun recognize(ctx: Context, src: Bitmap): OcrResult {
         val base = ensureData(ctx)
+        val img = prepare(src)
         val tess = TessBaseAPI()
         try {
             if (!tess.init(base.absolutePath, "rus+eng")) error("Не удалось запустить Tesseract")
             tess.setPageSegMode(TessBaseAPI.PageSegMode.PSM_AUTO)
             tess.setVariable("preserve_interword_spaces", "1")
-            tess.setImage(prepare(src))
-            return tess.getUTF8Text() ?: ""
+            tess.setImage(img)
+            val text = tess.getUTF8Text() ?: ""
+            val words = mutableListOf<OcrWord>()
+            val iter = tess.resultIterator
+            if (iter != null) {
+                try {
+                    val word = TessBaseAPI.PageIteratorLevel.RIL_WORD
+                    var line = 0
+                    iter.begin()
+                    do {
+                        if (iter.isAtBeginningOf(TessBaseAPI.PageIteratorLevel.RIL_TEXTLINE)) line++
+                        val w = iter.getUTF8Text(word)
+                        val r = iter.getBoundingRect(word)
+                        if (!w.isNullOrBlank() && r != null) words += OcrWord(w.trim(), r.left, r.top, r.right, r.bottom, line)
+                    } while (iter.next(word))
+                } finally {
+                    iter.delete()
+                }
+            }
+            return OcrResult(text, words, img.width, img.height)
         } finally {
             tess.recycle()
         }
     }
 
-    /** Серый цвет, увеличение мелких картинок, инверсия тёмной темы. */
+    /** Серый цвет, увеличение ×2 (мелкий текст читается намного лучше), инверсия тёмной темы. */
     private fun prepare(src: Bitmap): Bitmap {
-        val scale = if (src.width < 1000) 2f else 1f
+        var scale = if (minOf(src.width, src.height) < 1300) 2f else 1f
+        if (maxOf(src.width, src.height) * scale > 6000f) scale = 6000f / maxOf(src.width, src.height)
         val w = (src.width * scale).toInt()
         val h = (src.height * scale).toInt()
         val out = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)

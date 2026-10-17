@@ -25,9 +25,11 @@ object ClaudeVision {
             На изображении расписание или план. Сегодня $today ($wd).
             Извлеки все события, у которых есть время.
             Верни ТОЛЬКО JSON-массив без пояснений:
-            [{"date":"YYYY-MM-DD","start":"HH:MM","end":"HH:MM или null","title":"название события"}]
+            [{"date":"YYYY-MM-DD","start":"HH:MM","end":"HH:MM или null","title":"название события","location":"","note":""}]
             Если указан только день недели — возьми ближайшую такую дату, начиная с сегодня.
-            Если год не указан — выбери ближайший к сегодняшней дате. Строку статуса телефона (часы, батарея) игнорируй.
+            Если год не указан — выбери ближайший к сегодняшней дате.
+            Если это таблица по дням недели без дат — первая колонка это понедельник ${Layout.defaultWeekStart(today)}, следующие колонки — следующие дни.
+            В "title" пиши предмет/событие и тип занятия, аудиторию/кабинет — в "location", преподавателя и прочее — в "note". Строку статуса телефона (часы, батарея) игнорируй.
         """.trimIndent()
 
         val body = JSONObject()
@@ -84,7 +86,11 @@ object ClaudeVision {
             val date = runCatching { LocalDate.parse(o.optString("date")) }.getOrNull() ?: continue
             val start = ScheduleParser.parseTime(o.optString("start")) ?: continue
             val end = if (o.isNull("end")) null else ScheduleParser.parseTime(o.optString("end"))
-            res += ParsedEvent(date, start, end, o.optString("title").ifBlank { "Событие" })
+            res += ParsedEvent(
+                date, start, end, o.optString("title").ifBlank { "Событие" },
+                o.optString("location").takeUnless { it == "null" } ?: "",
+                o.optString("note").takeUnless { it == "null" } ?: "",
+            )
         }
         return res
     }

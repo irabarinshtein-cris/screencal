@@ -11,19 +11,26 @@ data class ParsedEvent(
     val start: LocalTime,
     val end: LocalTime?,
     val title: String,
+    val location: String = "",
+    val note: String = "",
+    /** Для таблиц-сеток: номер колонки (день от начала недели), если дата взята не из скрина. */
+    val dayOffset: Int? = null,
+    /** Учебные недели пары из пометок «(2–16 нед.)», «(на 8 нед.)». */
+    val weekFrom: Int? = null,
+    val weekTo: Int? = null,
 )
 
+data class LineInfo(val date: LocalDate?, val times: List<Pair<LocalTime, LocalTime?>>, val rest: String)
+
 /**
- * Разбирает текст расписания (после OCR) в список событий.
+ * Разбор текста расписания.
  * Понимает: 17.10, 17.10.2026, 2026-10-17, 17 октября, пн/понедельник, сегодня/завтра,
  * 10:00-11:30, 10.00–11.30, с 10:00 до 11:30, одиночное 10:00.
- * Дата из строки-заголовка применяется ко всем событиям ниже до следующей даты.
  */
 object ScheduleParser {
 
-    private val RANGE = Regex(
-        "(?<!\\d)(?:(?<!\\p{L})с\\s*)?([01]?\\d|2[0-3])[:.]([0-5]\\d)\\s*(?:-|–|—|до|по)\\s*([01]?\\d|2[0-3])[:.]([0-5]\\d)(?!\\d)"
-    )
+    private const val T = "([01]?\\d|2[0-3])[:.]([0-5]\\d)"
+    private val RANGE = Regex("(?<!\\d)(?:(?<!\\p{L})с\\s*)?$T\\s*(?:-|–|—|до|по)\\s*$T(?!\\d)")
     private val ISO_DATE = Regex("(?<!\\d)(\\d{4})-(\\d{1,2})-(\\d{1,2})(?!\\d)")
     private val FULL_DATE = Regex("(?<!\\d)(\\d{1,2})[./](\\d{1,2})[./](\\d{4}|\\d{2})(?!\\d)")
     private const val MONTHS =
@@ -40,53 +47,144 @@ object ScheduleParser {
     private val RELATIVE = Regex("(?<!\\p{L})(сегодня|послезавтра|завтра)(?!\\p{L})")
     private val WEEK = Regex("(?<!\\p{L})(недел[юяеи]|7 дней)(?!\\p{L})")
 
-    // ---------- публичное API ----------
+    // шаблоны применяются к тексту в нижнем регистре
+    private val TYPE = Regex("(лекци|практик|лаборатор|семинар|зач[её]т|экзамен|консультац|комисси|пересдач)")
+    private val ROOM = Regex(
+        "^(?:[а-яёa-z]{1,2}-?\\d{1,4}[а-я]?(?![\\d:.])|.*(?<!\\p{L})(?:ауд|каб|кабинет|аудитория)\\.?\\s*№?\\s*\\d|спортзал)"
+    )
+    private val PERSON = Regex("\\p{Lu}\\.\\s?\\p{Lu}\\.|^\\p{Lu}\\p{Ll}+\\s+\\p{Lu}\\p{Ll}+\\s+\\p{Lu}\\p{Ll}+(вич|вна|ична|чна|оглы|кызы)\\b")
+
+    // ---------- список (лента событий с датами-заголовками) ----------
 
     fun parse(text: String, today: LocalDate): List<ParsedEvent> {
-        class Ev(val date: LocalDate, val start: LocalTime, val end: LocalTime?, var title: String, val orphan: String?)
+        class Ev(val date: LocalDate, val start: LocalTime, val end: LocalTime?, var title: String, val orphan: String?) {
+            var location = ""
+            val notes = mutableListOf<String>()
+        }
 
+        val fix = isCyrillic(text)
         val out = mutableListOf<Ev>()
         var ctxDate: LocalDate? = null
         var lastEvents: List<Ev> = emptyList()
-        var pending: List<Ev> = emptyList()   // события без названия, ждут следующую строку
-        var extra = 0                          // сколько строк-пояснений можно дописать
-        var orphan: String? = null             // текст без времени, пока никуда не пристроен
+        var pending: List<Ev> = emptyList()
+        var extra = 0
+        var continuation = false
+        var orphan: String? = null
 
         for (raw in text.lines()) {
-            val line = raw.trim()
+            val line = (if (fix) fixHomoglyphs(raw) else raw).trim()
             if (line.isEmpty()) continue
-            val info = analyze(line, today)
+            val info = lineInfo(line, today)
             if (info.date != null) ctxDate = info.date
 
             if (info.times.isNotEmpty()) {
                 val date = ctxDate ?: today
-                val created = info.times.map { (s, e) -> Ev(date, s, e, info.rest, orphan) }
+                val title = stripIcon(info.rest)
+                val created = info.times.map { (s, e) -> Ev(date, s, e, title, orphan) }
                 out += created
                 orphan = null
                 lastEvents = created
                 pending = created.filter { it.title.isBlank() }
-                extra = 1
+                extra = 2
+                continuation = true
                 continue
             }
-
-            if (info.date != null) {           // строка-заголовок с датой
+            if (info.date != null) {
                 lastEvents = emptyList(); pending = emptyList(); orphan = null
                 continue
             }
-            if (info.rest.isBlank()) continue
+            val r = info.rest
+            if (!r.any { it.isLetterOrDigit() }) continue
 
             when {
-                pending.isNotEmpty() -> { pending.forEach { it.title = info.rest }; pending = emptyList() }
+                pending.isNotEmpty() -> { pending.forEach { it.title = stripIcon(r) }; pending = emptyList() }
+                lastEvents.isNotEmpty() && continuation && r.first().isLowerCase() && !isRoom(r) ->
+                    lastEvents.forEach { it.title = "${it.title} $r" }
                 lastEvents.isNotEmpty() && extra > 0 -> {
-                    lastEvents.forEach { it.title = "${it.title} · ${info.rest}" }; extra--
+                    continuation = false
+                    extra--
+                    lastEvents.forEach { if (isRoom(r) && it.location.isBlank()) it.location = r else it.notes += r }
                 }
-                else -> { orphan = info.rest; lastEvents = emptyList() }
+                else -> { orphan = r; lastEvents = emptyList() }
             }
         }
 
-        return out.map { ParsedEvent(it.date, it.start, it.end, it.title.ifBlank { it.orphan ?: "Событие" }) }
-            .distinctBy { Triple(it.date, it.start, it.title.lowercase()) }
+        return out.map {
+            ParsedEvent(it.date, it.start, it.end, it.title.ifBlank { it.orphan ?: "Событие" }, it.location, it.notes.joinToString("\n"))
+        }.distinctBy { Triple(it.date, it.start, it.title.lowercase()) }
     }
+
+    // ---------- одна ячейка таблицы-сетки ----------
+
+    /** Ячейка: «Предмет / Преподаватель / Тип занятия / Аудитория / 09:30 – 11:00». */
+    fun parseCell(lines: List<String>, date: LocalDate, today: LocalDate, dayOffset: Int?): ParsedEvent? {
+        val infos = lines.map { lineInfo(it, today) }
+        // в таблице у пары всегда есть начало и конец; одиночное время — подпись/служебный текст
+        val ti = infos.indexOfFirst { info -> info.times.any { it.second != null } && info.date == null }
+        if (ti < 0) return null
+        val (start, end) = infos[ti].times.first { it.second != null }
+
+        val texts = lines.indices.mapNotNull { i -> if (i == ti) infos[i].rest else clean(lines[i]) }
+            .map { stripIcon(it) }
+            .filter { s -> s.count { it.isLetter() } >= 2 || (s.any { it.isLetter() } && s.any { it.isDigit() }) }
+
+        val room = texts.firstOrNull { isRoom(it) } ?: ""
+        val typeLine = texts.firstOrNull { it != room && isType(it) }
+        val subject = texts.firstOrNull { it != room && it != typeLine && !isPerson(it) }
+        val type = typeLine?.let { shortType(it) } ?: ""
+        val notes = texts.filter { it != room && it != typeLine && it != subject }
+
+        val title = listOf(subject ?: "", type).filter { it.isNotBlank() }.joinToString(" — ").ifBlank { "Занятие" }
+        val span = weekSpan(lines.filterIndexed { i, _ -> i != ti })
+        return ParsedEvent(date, start, end, title, room, notes.joinToString("\n"), dayOffset, span?.first, span?.second)
+    }
+
+    private val W_LIST = Regex("на\\s*((?:\\d{1,2}\\s*,\\s*)+\\d{1,2})\\s*нед")
+    private val W_RANGE = Regex("\\((\\d{1,2})\\s*[-–—]\\s*(\\d{1,2})|(\\d{1,2})\\s*[-–—]\\s*(\\d{1,2})\\s*нед")
+    private val W_SINGLE = Regex("на\\s*(\\d{1,2})\\s*не")
+
+    /** Недели из пометок: «2 – 16 нед.» → 2..16, «на 8 нед.» → 8..8, «на 2, 4, 6 нед.» → 2..6. */
+    fun weekSpan(lines: List<String>): Pair<Int, Int>? {
+        for (raw in lines) {
+            val l = raw.lowercase()
+            W_LIST.find(l)?.let { m ->
+                val ws = m.groupValues[1].split(",").mapNotNull { it.trim().toIntOrNull() }
+                if (ws.isNotEmpty()) return ws.min() to ws.max()
+            }
+            W_RANGE.find(l)?.let { m ->
+                val g = m.groupValues
+                val a = (g[1].ifEmpty { g[3] }).toInt()
+                val b = (g[2].ifEmpty { g[4] }).toInt()
+                if (a in 1..30 && b in a..30) return a to b
+            }
+            W_SINGLE.find(l)?.let { m -> m.groupValues[1].toInt().takeIf { it in 1..30 }?.let { return it to it } }
+        }
+        return null
+    }
+
+    /** Зачёты, экзамены, комиссии, пересдачи — разовые, даже в расписании пар. */
+    fun isOneOff(title: String): Boolean =
+        Regex("(комисси|пересдач|зач[её]т|экзамен|консультац)").containsMatchIn(title.lowercase())
+
+    private val WEEK_NO = Regex("№\\s*(\\d{1,2})(?!\\d)|(?<!\\d)(\\d{1,2})\\s*(?:-?я)?\\s*(?:учебная\\s+)?неделя")
+
+    /** Номер учебной недели со скрина («№8, чётная», «8-я неделя»). */
+    fun weekNumberIn(text: String): Int? =
+        WEEK_NO.find(text.lowercase())?.groupValues?.let { g -> (g[1].ifEmpty { g[2] }).toIntOrNull() }?.takeIf { it in 1..30 }
+
+    private fun shortType(s: String): String =
+        s.substringBefore("(")
+            .replace(Regex("\\s*[+«»*•·]\\s*"), " • ")
+            .replace(Regex("(\\.\\.\\.|…)$"), "")
+            .trim()
+
+    fun isRoom(s: String): Boolean = ROOM.containsMatchIn(s.trim().lowercase())
+
+    private fun isType(s: String): Boolean = TYPE.containsMatchIn(s.lowercase())
+
+    private fun isPerson(s: String): Boolean = PERSON.containsMatchIn(s)
+
+    // ---------- вопросы о свободном времени ----------
 
     /** Все даты, упомянутые в вопросе («когда свободен 20–22 октября», «завтра», «в пятницу», «неделя»). */
     fun datesIn(text: String, today: LocalDate): List<LocalDate> {
@@ -114,9 +212,52 @@ object ScheduleParser {
         return LocalTime.of(m.groupValues[1].toInt(), m.groupValues[2].toInt())
     }
 
-    // ---------- разбор одной строки ----------
+    /** День недели из заголовка («Понедельник», «пт»), если он есть. */
+    fun weekdayIn(s: String): DayOfWeek? = WEEKDAY.find(s.lowercase())?.let { dow(it.value) }
 
-    private data class LineInfo(val date: LocalDate?, val times: List<Pair<LocalTime, LocalTime?>>, val rest: String)
+    // ---------- исправление OCR ----------
+
+    fun isCyrillic(text: String): Boolean {
+        var cyr = 0
+        var lat = 0
+        for (c in text) {
+            if (c in 'а'..'я' || c in 'А'..'Я' || c == 'ё' || c == 'Ё') cyr++
+            else if (c in 'a'..'z' || c in 'A'..'Z') lat++
+        }
+        return cyr > lat * 2
+    }
+
+    private val HOMO = mapOf(
+        'A' to 'А', 'B' to 'В', 'C' to 'С', 'E' to 'Е', 'H' to 'Н', 'K' to 'К', 'M' to 'М', 'O' to 'О',
+        'P' to 'Р', 'T' to 'Т', 'X' to 'Х', 'Y' to 'У', 'U' to 'И', 'N' to 'Л',
+        'a' to 'а', 'c' to 'с', 'e' to 'е', 'o' to 'о', 'p' to 'р', 'x' to 'х', 'y' to 'у', 'u' to 'и',
+    )
+
+    /** Латинские «двойники» в русском тексте (A-245 → А-245, MuC3UBKC → МиСЗИВКС). */
+    fun fixHomoglyphs(s: String): String = Regex("[A-Za-z0-9]+").replace(s) { m ->
+        val w = m.value
+        if (w.none { it in 'A'..'Z' || it in 'a'..'z' }) return@replace w
+        if (w.any { (it in 'A'..'Z' || it in 'a'..'z') && it !in HOMO }) return@replace w
+        buildString {
+            w.forEachIndexed { i, c ->
+                append(
+                    when {
+                        c == '3' && (w.getOrNull(i - 1)?.isLetter() == true || w.getOrNull(i + 1)?.isLetter() == true) -> 'З'
+                        else -> HOMO[c] ?: c
+                    }
+                )
+            }
+        }
+    }
+
+    /** Убирает значок-иконку, прочитанный как один символ в начале строки («а УиАИС» → «УиАИС»). */
+    fun stripIcon(s: String): String {
+        val t = s.trim()
+        val first = t.substringBefore(' ', t)
+        return if (first.length == 1 && t.length > 2 && !first[0].isDigit()) clean(t.substring(1)) else t
+    }
+
+    // ---------- разбор одной строки ----------
 
     private class Line(orig: String) {
         val low: String = orig.lowercase()
@@ -136,7 +277,7 @@ object ScheduleParser {
         fun rest(): String = buildString { base.forEachIndexed { i, c -> append(if (used[i]) ' ' else c) } }
     }
 
-    private fun analyze(raw: String, today: LocalDate): LineInfo {
+    fun lineInfo(raw: String, today: LocalDate): LineInfo {
         val l = Line(raw)
         val times = mutableListOf<Pair<Int, Pair<LocalTime, LocalTime?>>>()
         val singles = mutableListOf<Pair<Int, LocalTime>>()
@@ -174,9 +315,9 @@ object ScheduleParser {
     }
 
     private fun clean(s: String): String =
-        (" $s ").replace(Regex("(?<=\\s)[-–—|•·*,;:]+(?=\\s)"), " ")
+        (" $s ").replace(Regex("(?<=\\s)[-–—|•·*,;:=]+(?=\\s)"), " ")
             .replace(Regex("\\s+"), " ")
-            .trim { it.isWhitespace() || it in "-–—|:;,.•·*" }
+            .trim { it.isWhitespace() || it in "-–—|:;,.•·*=" }
 
     // ---------- даты ----------
 
@@ -185,7 +326,7 @@ object ScheduleParser {
 
     private fun year(s: String): Int = s.toInt().let { if (it < 100) 2000 + it else it }
 
-    /** Без года — берём ближайший к сегодняшнему дню (прошлое не дальше 2 месяцев). */
+    /** Без года — ближайший к сегодняшнему дню (прошлое не дальше 2 месяцев). */
     private fun withYear(d: Int, m: Int, y: Int?, today: LocalDate): LocalDate? {
         if (m !in 1..12 || d !in 1..31) return null
         if (y != null) return safeDate(if (y < 100) 2000 + y else y, m, d)

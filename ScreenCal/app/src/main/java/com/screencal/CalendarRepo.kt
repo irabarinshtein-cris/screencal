@@ -71,8 +71,11 @@ object CalendarRepo {
     private fun millis(d: LocalDate, t: LocalTime): Long =
         d.atTime(t).atZone(ZoneId.systemDefault()).toInstant().toEpochMilli()
 
-    /** Добавляет событие. false — такое уже есть (повторная отправка того же скрина). */
-    fun insert(ctx: Context, calId: Long, ev: ParsedEvent): Boolean {
+    /**
+     * Добавляет событие. rrule — правило повтора (null — разовое), tag — метка серии расписания.
+     * false — такое уже есть (повторная отправка того же скрина).
+     */
+    fun insert(ctx: Context, calId: Long, ev: ParsedEvent, rrule: String? = null, tag: String? = null): Boolean {
         val start = millis(ev.date, ev.start)
         val endTime = ev.end ?: ev.start.plusHours(1)
         val end = if (endTime.isAfter(ev.start)) millis(ev.date, endTime) else millis(ev.date.plusDays(1), endTime)
@@ -87,12 +90,53 @@ object CalendarRepo {
             put(Events.CALENDAR_ID, calId)
             put(Events.TITLE, ev.title)
             put(Events.DTSTART, start)
-            put(Events.DTEND, end)
+            if (rrule != null) {
+                // у повторяющегося события вместо конца указывается длительность
+                put(Events.DURATION, "P${(end - start) / 1000}S")
+                put(Events.RRULE, rrule)
+            } else {
+                put(Events.DTEND, end)
+            }
             put(Events.EVENT_TIMEZONE, ZoneId.systemDefault().id)
-            put(Events.DESCRIPTION, "Добавлено из скриншота (СкринКалендарь)")
+            if (ev.location.isNotBlank()) put(Events.EVENT_LOCATION, ev.location)
+            put(
+                Events.DESCRIPTION,
+                listOf(ev.note, "Добавлено из скриншота (СкринКалендарь)", tag ?: "").filter { it.isNotBlank() }.joinToString("\n"),
+            )
         }
         ctx.contentResolver.insert(Events.CONTENT_URI, v) ?: error("Календарь отказал в записи")
         return true
+    }
+
+    /**
+     * Новое расписание заменяет старое той же чётности недели: прежние серии пар обрываются
+     * перед [from] (понедельник новой недели), а серии, начинающиеся с [from] и позже, удаляются.
+     * Трогаются только события, созданные этим приложением в режиме «Расписание пар».
+     */
+    fun cutSchedule(ctx: Context, calId: Long, tag: String, from: LocalDate): Int {
+        val zone = ZoneId.systemDefault()
+        val fromMs = from.atStartOfDay(zone).toInstant().toEpochMilli()
+        var n = 0
+        ctx.contentResolver.query(
+            Events.CONTENT_URI, arrayOf(Events._ID, Events.DTSTART, Events.RRULE),
+            "${Events.CALENDAR_ID} = ? AND ${Events.DELETED} = 0 AND ${Events.DESCRIPTION} LIKE ?",
+            arrayOf(calId.toString(), "%$tag%"), null,
+        )?.use { c ->
+            while (c.moveToNext()) {
+                val id = c.getLong(0)
+                val uri = ContentUris.withAppendedId(Events.CONTENT_URI, id)
+                val rule = c.getString(2)
+                if (c.getLong(1) >= fromMs) {
+                    ctx.contentResolver.delete(uri, null, null)
+                    n++
+                } else if (!rule.isNullOrBlank()) {
+                    val v = ContentValues().apply { put(Events.RRULE, Recurrence.cutRule(rule, Instant.ofEpochMilli(fromMs - 1000))) }
+                    ctx.contentResolver.update(uri, v, null, null)
+                    n++
+                }
+            }
+        }
+        return n
     }
 
     /** Занятые интервалы из всех видимых календарей (события «свободен» и на весь день не учитываются). */

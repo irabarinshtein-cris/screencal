@@ -41,6 +41,8 @@ import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.Checkbox
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
@@ -131,6 +133,14 @@ data class Draft(
     val start: String,
     val end: String,
     val checked: Boolean = true,
+    val location: String = "",
+    val note: String = "",
+    val dayOffset: Int? = null,
+    val repeat: Repeat = Repeat.NONE,
+    /** Последняя дата повтора (дд.мм.гггг), пусто — бессрочно. */
+    val until: String = "",
+    val weekFrom: Int? = null,
+    val weekTo: Int? = null,
 )
 
 private var idCounter = 0L
@@ -142,14 +152,38 @@ private fun ParsedEvent.toDraft() = Draft(
     start = start.format(TIME_FMT),
     end = end?.format(TIME_FMT) ?: "",
     checked = title.any { it.isLetter() },
+    location = location,
+    note = note,
+    dayOffset = dayOffset,
+    weekFrom = weekFrom,
+    weekTo = weekTo,
 )
 
+private fun parseDate(s: String): LocalDate? = runCatching { LocalDate.parse(s.trim(), DATE_IN) }.getOrNull()
+
 private fun Draft.toEvent(): ParsedEvent? {
-    val d = runCatching { LocalDate.parse(date.trim(), DATE_IN) }.getOrNull() ?: return null
+    val d = parseDate(date) ?: return null
     val s = ScheduleParser.parseTime(start) ?: return null
     val e = if (end.isBlank()) null else ScheduleParser.parseTime(end) ?: return null
     if (title.isBlank()) return null
-    return ParsedEvent(d, s, e, title.trim())
+    return ParsedEvent(d, s, e, title.trim(), location.trim(), note.trim())
+}
+
+/** Правило повтора карточки; Result.failure — неверная дата «до». */
+private fun Draft.rrule(): Result<String?> {
+    if (repeat == Repeat.NONE) return Result.success(null)
+    val u = if (until.isBlank()) null else parseDate(until) ?: return Result.failure(IllegalArgumentException())
+    return Result.success(Recurrence.rrule(repeat, u))
+}
+
+/** Пересчёт даты и повтора карточки под выбранный режим. */
+private fun Draft.planned(mode: AddMode, weekStart: LocalDate?, weekNo: Int?): Draft {
+    val off = dayOffset
+    val base = (if (off != null && weekStart != null) weekStart.plusDays(off.toLong()) else parseDate(date)) ?: return this
+    if (mode == AddMode.ONE_TIME) return copy(date = base.format(DATE_FMT), repeat = Repeat.NONE, until = "")
+    val p = Recurrence.planPair(base, weekNo, weekFrom, weekTo, ScheduleParser.isOneOff(title))
+        ?: return copy(date = base.format(DATE_FMT), repeat = Repeat.NONE, until = "", checked = false)
+    return copy(date = p.first.format(DATE_FMT), repeat = p.second, until = p.third?.format(DATE_FMT) ?: "")
 }
 
 private fun hasPerms(ctx: Context, perms: Array<String>) =
@@ -211,6 +245,27 @@ fun ScreenTab(prefs: Prefs, drafts: SnapshotStateList<Draft>, sharedUri: Mutable
     var rawText by remember { mutableStateOf("") }
     var showRaw by remember { mutableStateOf(false) }
     var preview by remember { mutableStateOf<Bitmap?>(null) }
+    var mode by remember { mutableStateOf(AddMode.ONE_TIME) }
+    // для таблиц по дням без дат: дата первой колонки (понедельник недели)
+    var weekStart by remember { mutableStateOf<LocalDate?>(null) }
+    // номер учебной недели на скрине (для пометок «2–16 нед.»)
+    var weekNo by remember { mutableStateOf("") }
+
+    fun replan() {
+        val ws = weekStart
+        val n = weekNo.trim().toIntOrNull()
+        for (i in drafts.indices) drafts[i] = drafts[i].planned(mode, ws, n)
+    }
+
+    fun applyWeek(start: LocalDate) {
+        weekStart = start
+        replan()
+    }
+
+    fun setMode(m: AddMode) {
+        mode = m
+        replan()
+    }
 
     fun process(uri: Uri) {
         busy = true
@@ -221,19 +276,25 @@ fun ScreenTab(prefs: Prefs, drafts: SnapshotStateList<Draft>, sharedUri: Mutable
                 preview = bmp
                 val today = LocalDate.now()
                 val useClaude = prefs.mode == "claude" && prefs.apiKey.isNotBlank()
-                val (text, events) = withContext(Dispatchers.Default) {
+                val ex = withContext(Dispatchers.Default) {
                     if (useClaude) {
-                        "" to ClaudeVision.recognize(bmp, prefs.apiKey, prefs.model, today)
+                        Extracted(ClaudeVision.recognize(bmp, prefs.apiKey, prefs.model, today), "", false)
                     } else {
-                        val t = Ocr.recognize(ctx, bmp)
-                        t to ScheduleParser.parse(t, today)
+                        val r = Ocr.recognize(ctx, bmp)
+                        if (r.words.isEmpty()) Extracted(ScheduleParser.parse(r.text, today), r.text, false)
+                        else Layout.extract(r.words, r.width, r.height, today, Layout.defaultWeekStart(today))
                     }
                 }
-                rawText = text
+                val events = ex.events
+                rawText = ex.text
+                weekStart = if (ex.datesGuessed) Layout.defaultWeekStart(today) else null
+                weekNo = ex.weekNumber?.toString() ?: ""
+                mode = if (ex.isSchedule) AddMode.SCHEDULE else AddMode.ONE_TIME
                 drafts.clear()
                 drafts.addAll(events.map { it.toDraft() })
+                replan()
                 status = if (events.isEmpty()) "События не найдены. Проверьте распознанный текст или добавьте вручную."
-                else "Найдено: ${events.size}. Проверьте и нажмите «Добавить в календарь»."
+                else "Найдено: ${events.size}. Проверьте режим и карточки, затем «Добавить в календарь»."
             } catch (e: Exception) {
                 status = "Ошибка: ${e.message}"
             } finally {
@@ -244,28 +305,45 @@ fun ScreenTab(prefs: Prefs, drafts: SnapshotStateList<Draft>, sharedUri: Mutable
 
     fun save() {
         val list = drafts.toList()
+        val schedule = mode == AddMode.SCHEDULE
         busy = true
         scope.launch {
             try {
-                val (added, dup, bad) = withContext(Dispatchers.IO) {
+                data class Res(val added: Int, val dup: Int, val bad: List<Int>, val replaced: Int)
+                val res = withContext(Dispatchers.IO) {
                     val calId = CalendarRepo.resolveCalendar(ctx, prefs)
-                    var a = 0
-                    var d = 0
-                    val b = mutableListOf<Int>()
+                    // проверка всех карточек до записи
+                    val bad = mutableListOf<Int>()
+                    val ready = mutableListOf<Triple<ParsedEvent, String?, String?>>()
                     list.forEachIndexed { i, dr ->
                         if (!dr.checked) return@forEachIndexed
                         val ev = dr.toEvent()
-                        if (ev == null) b += i + 1
-                        else if (CalendarRepo.insert(ctx, calId, ev)) a++ else d++
+                        val rule = dr.rrule()
+                        if (ev == null || rule.isFailure) { bad += i + 1; return@forEachIndexed }
+                        val r = rule.getOrNull()
+                        val tag = if (schedule && r != null) Recurrence.scheduleTag(ev.date) else null
+                        ready += Triple(ev, r, tag)
                     }
-                    Triple(a, d, b)
+                    if (bad.isNotEmpty()) return@withContext Res(0, 0, bad, 0)
+                    // новое расписание заменяет прежнее (той же чётности недели) начиная с этой недели
+                    var replaced = 0
+                    ready.filter { it.third != null }.groupBy { it.third!! }.forEach { (tag, items) ->
+                        val from = Recurrence.monday(items.minOf { it.first.date })
+                        replaced += CalendarRepo.cutSchedule(ctx, calId, tag, from)
+                    }
+                    var a = 0
+                    var d = 0
+                    for ((ev, r, tag) in ready) if (CalendarRepo.insert(ctx, calId, ev, r, tag)) a++ else d++
+                    Res(a, d, emptyList(), replaced)
                 }
-                status = buildString {
-                    append("Добавлено в календарь: $added.")
-                    if (dup > 0) append(" Уже были: $dup.")
-                    if (bad.isNotEmpty()) append(" Исправьте дату/время в карточках №${bad.joinToString()}.")
+                status = if (res.bad.isNotEmpty()) {
+                    "Ничего не записано: исправьте дату/время/«до» в карточках №${res.bad.joinToString()}."
+                } else buildString {
+                    append("Добавлено в календарь: ${res.added}.")
+                    if (res.dup > 0) append(" Уже были: ${res.dup}.")
+                    if (res.replaced > 0) append(" Прежнее расписание заменено (серий: ${res.replaced}).")
                 }
-                if (bad.isEmpty()) drafts.clear()
+                if (res.bad.isEmpty()) { drafts.clear(); weekStart = null }
             } catch (e: Exception) {
                 status = "Ошибка записи: ${e.message}"
             } finally {
@@ -295,10 +373,27 @@ fun ScreenTab(prefs: Prefs, drafts: SnapshotStateList<Draft>, sharedUri: Mutable
                 OutlinedButton(
                     onClick = {
                         drafts += Draft(++idCounter, "", LocalDate.now().format(DATE_FMT), "", "")
+                            .let { if (mode == AddMode.SCHEDULE) it.copy(repeat = Repeat.BIWEEKLY) else it }
                     },
                     enabled = !busy,
                 ) { Text("Вручную") }
             }
+        }
+        item {
+            // режим: расписание пар (повтор, заменяет прежнее) или разовые события
+            Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                listOf(AddMode.SCHEDULE to "Расписание пар", AddMode.ONE_TIME to "Разовые").forEach { (m, label) ->
+                    if (mode == m) Button(onClick = { setMode(m) }, modifier = Modifier.weight(1f)) { Text(label) }
+                    else OutlinedButton(onClick = { setMode(m) }, modifier = Modifier.weight(1f)) { Text(label) }
+                }
+            }
+            Text(
+                if (mode == AddMode.SCHEDULE)
+                    "Пары повторяются раз в 2 недели (чётная/нечётная) на все следующие месяцы. Пометки «2–16 нед.» задают конец, зачёты и экзамены — разово. Новое расписание заменит прежнее той же недели (чёт/нечёт)."
+                else "События добавляются только на свою дату. Повтор можно включить в карточке вручную.",
+                style = MaterialTheme.typography.bodySmall,
+                modifier = Modifier.padding(horizontal = 16.dp, vertical = 6.dp),
+            )
         }
         item {
             Row(Modifier.padding(horizontal = 16.dp), verticalAlignment = Alignment.CenterVertically) {
@@ -317,6 +412,41 @@ fun ScreenTab(prefs: Prefs, drafts: SnapshotStateList<Draft>, sharedUri: Mutable
                 )
             }
         }
+        if (weekStart != null || mode == AddMode.SCHEDULE) {
+            item {
+                Card(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 6.dp)) {
+                    Column(Modifier.padding(12.dp)) {
+                        weekStart?.let { ws ->
+                            Text(
+                                "На скрине нет дат — дни посчитаны по колонкам (1-я колонка = понедельник).",
+                                style = MaterialTheme.typography.bodySmall,
+                            )
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                Text("Неделя с:", modifier = Modifier.weight(1f))
+                                TextButton(onClick = {
+                                    DatePickerDialog(ctx, { _, y, m, d -> applyWeek(LocalDate.of(y, m + 1, d)) },
+                                        ws.year, ws.monthValue - 1, ws.dayOfMonth).show()
+                                }) { Text("${ws.format(DATE_FMT)}, ${ws.dayOfWeek.getDisplayName(TextStyle.SHORT, RU)}") }
+                            }
+                            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                OutlinedButton(onClick = { applyWeek(ws.minusWeeks(1)) }) { Text("← неделя") }
+                                OutlinedButton(onClick = { applyWeek(ws.plusWeeks(1)) }) { Text("неделя →") }
+                            }
+                        }
+                        if (mode == AddMode.SCHEDULE) {
+                            OutlinedTextField(
+                                weekNo, { weekNo = it.filter { c -> c.isDigit() }.take(2); replan() },
+                                label = { Text("№ учебной недели на скрине") },
+                                placeholder = { Text("например 8") },
+                                singleLine = true,
+                                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                                modifier = Modifier.fillMaxWidth().padding(top = 6.dp),
+                            )
+                        }
+                    }
+                }
+            }
+        }
         items(drafts, key = { it.id }) { d ->
             DraftCard(
                 d,
@@ -330,7 +460,12 @@ fun ScreenTab(prefs: Prefs, drafts: SnapshotStateList<Draft>, sharedUri: Mutable
                     onClick = { if (hasPerms(ctx, CAL_PERMS)) save() else permLauncher.launch(CAL_PERMS) },
                     enabled = !busy && drafts.any { it.checked },
                     modifier = Modifier.fillMaxWidth().padding(16.dp),
-                ) { Text("Добавить в календарь (${drafts.count { it.checked }})") }
+                ) {
+                    Text(
+                        (if (mode == AddMode.SCHEDULE) "Сохранить расписание" else "Добавить в календарь") +
+                            " (${drafts.count { it.checked }})"
+                    )
+                }
             }
         }
         if (rawText.isNotBlank()) {
@@ -351,18 +486,19 @@ fun ScreenTab(prefs: Prefs, drafts: SnapshotStateList<Draft>, sharedUri: Mutable
 }
 
 private fun weekdayLabel(date: String): String =
-    runCatching { LocalDate.parse(date.trim(), DATE_IN) }.getOrNull()
-        ?.dayOfWeek?.getDisplayName(TextStyle.FULL, RU)?.replaceFirstChar { it.uppercase() }
+    parseDate(date)?.dayOfWeek?.getDisplayName(TextStyle.FULL, RU)?.replaceFirstChar { it.uppercase() }
         ?: "Дата не распознана"
 
 @Composable
 fun DraftCard(d: Draft, onChange: (Draft) -> Unit, onDelete: () -> Unit) {
+    var menu by remember { mutableStateOf(false) }
     Card(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 6.dp)) {
         Column(Modifier.padding(start = 4.dp, end = 12.dp, bottom = 12.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Checkbox(checked = d.checked, onCheckedChange = { onChange(d.copy(checked = it)) })
                 Text(
-                    weekdayLabel(d.date), style = MaterialTheme.typography.titleSmall,
+                    weekdayLabel(d.date) + if (d.repeat != Repeat.NONE) " · " + d.repeat.label.lowercase() else "",
+                    style = MaterialTheme.typography.titleSmall,
                     modifier = Modifier.weight(1f),
                 )
                 IconButton(onClick = onDelete) { Icon(Icons.Filled.Delete, contentDescription = "Удалить") }
@@ -389,6 +525,40 @@ fun DraftCard(d: Draft, onChange: (Draft) -> Unit, onDelete: () -> Unit) {
                         keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
                         modifier = Modifier.weight(1f),
                     )
+                }
+                OutlinedTextField(
+                    d.location, { onChange(d.copy(location = it)) },
+                    label = { Text("Место") }, singleLine = true, modifier = Modifier.fillMaxWidth(),
+                )
+                // повтор события
+                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    Box(Modifier.weight(1.3f)) {
+                        OutlinedButton(onClick = { menu = true }, modifier = Modifier.fillMaxWidth()) {
+                            Text("↻ ${d.repeat.label}", maxLines = 1)
+                        }
+                        DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
+                            Repeat.entries.forEach { r ->
+                                DropdownMenuItem(
+                                    text = { Text(r.label) },
+                                    onClick = {
+                                        onChange(d.copy(repeat = r, until = if (r == Repeat.NONE) "" else d.until))
+                                        menu = false
+                                    },
+                                )
+                            }
+                        }
+                    }
+                    if (d.repeat != Repeat.NONE) {
+                        OutlinedTextField(
+                            d.until, { onChange(d.copy(until = it)) },
+                            label = { Text("Повтор до") }, placeholder = { Text("всегда") }, singleLine = true,
+                            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                            modifier = Modifier.weight(1f),
+                        )
+                    }
+                }
+                if (d.note.isNotBlank()) {
+                    Text(d.note, style = MaterialTheme.typography.bodySmall)
                 }
             }
         }
