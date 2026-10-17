@@ -1,0 +1,192 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>СкринКалендарь</title>
+  <meta name="description" content="Скрин расписания → Google Календарь, повторы пар, свободное время">
+  <meta name="theme-color" content="#3F51B5">
+  <link rel="manifest" href="manifest.webmanifest">
+  <link rel="icon" href="icons/icon.svg" type="image/svg+xml">
+  <link rel="apple-touch-icon" href="icons/icon-192.png">
+  <link rel="stylesheet" href="style.css">
+  <script src="config.js"></script>
+  <script src="https://accounts.google.com/gsi/client" async defer></script>
+  <script src="vendor/tesseract/tesseract.min.js" defer></script>
+  <script type="module" src="app.js"></script>
+</head>
+<body>
+  <header class="top">
+    <div class="brand">
+      <img src="icons/icon.svg" alt="" width="28" height="28">
+      <span>СкринКалендарь</span>
+    </div>
+    <button id="accountBtn" class="chip" type="button">Войти через Google</button>
+  </header>
+
+  <nav class="tabs" role="tablist">
+    <button class="tab active" data-tab="add" role="tab">Добавить</button>
+    <button class="tab" data-tab="free" role="tab">Свободно</button>
+    <button class="tab" data-tab="settings" role="tab">Настройки</button>
+  </nav>
+
+  <main>
+    <!-- ================= Добавить ================= -->
+    <section id="tab-add" class="panel">
+      <div class="seg" role="radiogroup" aria-label="Режим">
+        <button type="button" class="seg-btn" data-mode="schedule">Расписание пар</button>
+        <button type="button" class="seg-btn active" data-mode="once">Разовые</button>
+      </div>
+      <p id="modeHint" class="hint"></p>
+
+      <div id="drop" class="drop" tabindex="0">
+        <input id="fileInput" type="file" accept="image/*" hidden>
+        <div id="dropEmpty">
+          <strong>Загрузить скрин</strong>
+          <span>нажмите, перетащите или вставьте (Ctrl+V)</span>
+        </div>
+        <img id="preview" alt="Скрин" hidden>
+        <button id="clearImg" class="icon-btn" type="button" title="Убрать скрин" hidden>✕</button>
+      </div>
+
+      <label class="field">
+        <span>Дописать к скрину (или просто текст без скрина)</span>
+        <textarea id="extra" rows="2" placeholder="например: «повторять каждую неделю до 20 декабря», «это нечётная неделя, №9», «Бассейн по вторникам 19:00»"></textarea>
+      </label>
+
+      <div class="row">
+        <button id="recognizeBtn" class="btn primary grow" type="button">Распознать</button>
+        <button id="manualBtn" class="btn" type="button">＋ Вручную</button>
+      </div>
+      <label class="switch-line">
+        <input id="useAI" type="checkbox">
+        <span>Нейросеть GigaChat <small id="aiState"></small></span>
+      </label>
+
+      <p id="status" class="status" aria-live="polite"></p>
+
+      <div id="weekCard" class="card soft" hidden>
+        <div id="weekGuess" hidden>
+          <p class="small">На скрине нет дат — дни посчитаны по колонкам (1-я колонка = понедельник).</p>
+          <div class="row center">
+            <span class="grow">Неделя с</span>
+            <button id="weekPrev" class="btn small" type="button">←</button>
+            <input id="weekStart" type="date">
+            <button id="weekNext" class="btn small" type="button">→</button>
+          </div>
+        </div>
+        <label id="weekNoWrap" class="field inline" hidden>
+          <span>№ учебной недели на скрине</span>
+          <input id="weekNo" type="number" min="1" max="30" inputmode="numeric" placeholder="напр. 8">
+        </label>
+      </div>
+
+      <div id="cards"></div>
+
+      <details id="rawWrap" class="raw" hidden>
+        <summary>Распознанный текст</summary>
+        <pre id="rawText"></pre>
+      </details>
+    </section>
+
+    <!-- ================= Свободно ================= -->
+    <section id="tab-free" class="panel" hidden>
+      <p id="freeHint" class="hint"></p>
+      <label class="field">
+        <span>Вопрос</span>
+        <input id="question" type="text" placeholder="когда я свободен 20–22 октября? / завтра / в пятницу">
+      </label>
+      <div class="row wrap">
+        <button id="askBtn" class="btn primary" type="button">Ответить</button>
+        <button class="btn quick" data-quick="today" type="button">Сегодня</button>
+        <button class="btn quick" data-quick="tomorrow" type="button">Завтра</button>
+        <button class="btn quick" data-quick="week" type="button">7 дней</button>
+      </div>
+      <div class="range">
+        <label class="field"><span>с</span><input id="freeFrom" type="date"></label>
+        <label class="field"><span>по</span><input id="freeTo" type="date"></label>
+        <button id="freeShow" class="btn" type="button">Показать</button>
+      </div>
+      <p id="freeStatus" class="status"></p>
+      <div id="freeResult"></div>
+    </section>
+
+    <!-- ================= Настройки ================= -->
+    <section id="tab-settings" class="panel" hidden>
+      <div class="card">
+        <h3>Google</h3>
+        <p id="gState" class="small"></p>
+        <label class="field">
+          <span>Календарь для новых событий</span>
+          <select id="writeCal"><option value="primary">Основной</option></select>
+        </label>
+        <div class="field">
+          <span>Учитывать занятость из календарей</span>
+          <div id="busyCals" class="checks"><span class="small">войдите, чтобы увидеть календари</span></div>
+        </div>
+        <button id="signOut" class="btn small" type="button" hidden>Выйти из Google</button>
+      </div>
+
+      <div class="card">
+        <h3>Свободное время</h3>
+        <div class="row">
+          <label class="field grow"><span>День с</span><input id="dayStart" type="time" value="08:00"></label>
+          <label class="field grow"><span>до</span><input id="dayEnd" type="time" value="22:00"></label>
+          <label class="field grow"><span>Окно от, мин</span><input id="minFree" type="number" min="5" step="5" value="60"></label>
+        </div>
+      </div>
+
+      <div class="card">
+        <h3>Нейросеть GigaChat</h3>
+        <p class="small">Адрес функции-прокси из Yandex Cloud (см. инструкцию). Ключ GigaChat хранится там, а не в приложении.</p>
+        <label class="field"><span>Адрес прокси</span><input id="proxyUrl" type="url" placeholder="https://functions.yandexcloud.net/…"></label>
+        <label class="field"><span>Пароль приложения (если задан в функции)</span><input id="appKey" type="password" autocomplete="off"></label>
+        <button id="aiTest" class="btn small" type="button">Проверить связь</button>
+        <span id="aiTestRes" class="small"></span>
+      </div>
+
+      <details class="card">
+        <summary>Дополнительно</summary>
+        <label class="field"><span>Google OAuth Client ID</span><input id="clientId" type="text" placeholder="…apps.googleusercontent.com"></label>
+        <p class="small">Обычно задаётся в файле config.js. Здесь можно переопределить для этого устройства.</p>
+      </details>
+
+      <p class="small center"><button id="installBtn" class="btn small" type="button" hidden>Установить приложение</button></p>
+      <p id="iosHint" class="small center" hidden>На iPhone: «Поделиться» → «На экран Домой».</p>
+    </section>
+  </main>
+
+  <button id="saveFab" class="fab" type="button" hidden>Добавить в календарь</button>
+
+  <template id="cardTpl">
+    <article class="card ev">
+      <header class="ev-head">
+        <input type="checkbox" class="ev-check" aria-label="Добавлять">
+        <span class="ev-day"></span>
+        <button type="button" class="icon-btn ev-del" title="Удалить">✕</button>
+      </header>
+      <label class="field"><span>Событие</span><input class="f-title" type="text"></label>
+      <div class="dt">
+        <label class="field d"><span>Дата</span><input class="f-date" type="date"></label>
+        <label class="field"><span>С</span><input class="f-start" type="time"></label>
+        <label class="field"><span>До</span><input class="f-end" type="time"></label>
+      </div>
+      <label class="field"><span>Место</span><input class="f-loc" type="text"></label>
+      <div class="rep">
+        <label class="field"><span>Повтор</span>
+          <select class="f-repeat">
+            <option value="none">Не повторять</option>
+            <option value="daily">Ежедневно</option>
+            <option value="weekly">Еженедельно</option>
+            <option value="biweekly">Раз в 2 недели</option>
+            <option value="monthly">Ежемесячно</option>
+            <option value="yearly">Ежегодно</option>
+          </select>
+        </label>
+        <label class="field f-until-wrap"><span>Повтор до</span><input class="f-until" type="date"></label>
+      </div>
+      <p class="ev-note small"></p>
+    </article>
+  </template>
+</body>
+</html>
